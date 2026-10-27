@@ -77,6 +77,7 @@ struct AddrTable {
 
     DWORD ScriptSpace;
     DWORD ObjectPool;
+    DWORD VehiclePool;
     DWORD GameTimer;
     DWORD ModelInfoTable;
     DWORD StreamingInfoTable;
@@ -108,6 +109,7 @@ static const AddrTable kAddr_INTL = {
 
     0x821280, // CTheScripts::ScriptSpace
     0x94DBE0, // CPools::ms_pObjectPool
+    0xA0FDE4, // CPools::ms_pVehiclePool
     0x974B2C, // CTimer::m_snTimeInMilliseconds
     0x92D4C8, // CModelInfo::ms_modelInfoPtrs[]
     0x94DDD0  // CStreaming::ms_aInfoForModel[]
@@ -139,6 +141,7 @@ static const AddrTable kAddr_JP = {
 
     0x81E288, // CTheScripts::ScriptSpace
     0x94ABE8, // CPools::ms_pObjectPool
+    0xA0CDF4, // CPools::ms_pVehiclePool; JP GetVehicle at 0x4BF8E0
     0x971B34, // CTimer::m_snTimeInMilliseconds
     0x92A4D0, // CModelInfo::ms_modelInfoPtrs[]
     0x94ADD8  // CStreaming::ms_aInfoForModel[]
@@ -207,6 +210,8 @@ static int g_keyUnrigBomb = VK_F6;
 static int g_keyMarkVeh = VK_F7;
 static int g_keyUnmarkVeh = VK_F8;
 static int g_keyCarSpawner = VK_F9;
+static int g_keyGodBike = VK_F11;
+static int g_keyRigAllCarBombs = VK_F10;
 
 static char g_iniPath[MAX_PATH];
 
@@ -424,6 +429,15 @@ static void LoadConfig() {
             "F9",
             g_iniPath
         );
+
+        WritePrivateProfileStringA(
+            "Keys",
+            "GodBike",
+            "F11",
+            g_iniPath
+        );
+
+        WritePrivateProfileStringA("Keys", "RigAllCarBombs", "F10", g_iniPath);
     }
 
     g_keySpawnBarrel = ReadKey(
@@ -467,6 +481,9 @@ static void LoadConfig() {
         "F9",
         VK_F9
     );
+
+    g_keyGodBike = ReadKey("Keys", "GodBike", "F11", VK_F11);
+    g_keyRigAllCarBombs = ReadKey("Keys", "RigAllCarBombs", "F10", VK_F10);
 }
 
 
@@ -480,23 +497,27 @@ struct ActionKeys {
     bool unrigBomb;
     bool markVehicle;
     bool unmarkVehicle;
+    bool godBike;
+    bool rigAllCarBombs;
 };
 
 static bool s_keyWasDown[256] = {};
 
 static ActionKeys ReadActionKeys() {
-    const int keys[5] = {
+    const int keys[7] = {
         g_keySpawnBarrel,
         g_keyRigBomb,
         g_keyUnrigBomb,
         g_keyMarkVeh,
-        g_keyUnmarkVeh
+        g_keyUnmarkVeh,
+        g_keyGodBike,
+        g_keyRigAllCarBombs
     };
 
-    bool down[5] = {};
-    bool pressed[5] = {};
+    bool down[7] = {};
+    bool pressed[7] = {};
 
-    for (int i = 0; i < 5; ++i) {
+    for (int i = 0; i < 7; ++i) {
         const int key = keys[i];
         if (key >= 0 && key < 256) {
             down[i] = (GetAsyncKeyState(key) & 0x8000) != 0;
@@ -504,7 +525,7 @@ static ActionKeys ReadActionKeys() {
         }
     }
 
-    for (int i = 0; i < 5; ++i) {
+    for (int i = 0; i < 7; ++i) {
         const int key = keys[i];
         if (key >= 0 && key < 256)
             s_keyWasDown[key] = down[i];
@@ -516,6 +537,8 @@ static ActionKeys ReadActionKeys() {
     result.unrigBomb = pressed[2];
     result.markVehicle = pressed[3];
     result.unmarkVehicle = pressed[4];
+    result.godBike = pressed[5];
+    result.rigAllCarBombs = pressed[6];
     return result;
 }
 
@@ -881,6 +904,24 @@ static int CreateCarScript(int modelId, const CVector& position) {
 
     CRunningScriptRaw script = RunScriptCode(code);
     return static_cast<int>(script.localVars[0]);
+}
+
+static int GetPlayerVehicleScriptHandle() {
+    // COMMAND_STORE_CAR_PLAYER_IS_IN_NO_SAVE = 0x03C1.
+    // Obtain a pool reference without changing the vehicle's mission ownership.
+    ScriptCode code(0x03C1);
+    code.AddInt(0); // player index
+    code.AddLocalVar(0);
+    CRunningScriptRaw script = RunScriptCode(code);
+    return static_cast<int>(script.localVars[0]);
+}
+
+static void SetCarTractionScript(int vehicleHandle, float traction) {
+    // COMMAND_SET_CAR_TRACTION = 0x0423.
+    ScriptCode code(0x0423);
+    code.AddInt(vehicleHandle);
+    code.AddFloat(traction);
+    RunScriptCode(code);
 }
 
 static void WarpPlayerIntoCarScript(int vehicleHandle) {
@@ -1968,6 +2009,32 @@ static bool IsForbiddenSpawnModel(int modelId) {
 // Vehicle spawning
 // -------------------------------------------------------
 
+static int RigAllCarBombs() {
+    CPoolRaw* pool = *reinterpret_cast<CPoolRaw**>(g_addr->VehiclePool);
+    if (!pool || !pool->entries || !pool->flags)
+        return 0;
+
+    int count = 0;
+    // CPool<CVehicle, CAutomobile>: verified JP GetAtRef uses stride 0x5DC.
+    for (int i = 0; i < pool->size; ++i) {
+        if (pool->flags[i] & 0x80) // empty slot
+            continue;
+
+        BYTE* vehicle = pool->entries + static_cast<size_t>(i) * 0x5DC;
+        const int model = *reinterpret_cast<const short*>(vehicle + 0x5C);
+        // CEntity's type/status share +0x50: type in low 3 bits, status above.
+        if ((vehicle[0x50] & 7) != 2 || (vehicle[0x50] >> 3) == 5 ||
+            !(*reinterpret_cast<const float*>(vehicle + 0x204) > 0.0f) ||
+            !IsVehicleModelInRange(model) || IsForbiddenSpawnModel(model)) {
+            continue;
+        }
+
+        Rig(vehicle);
+        ++count;
+    }
+    return count;
+}
+
 static void SpawnVehicle(int modelId) {
     // Validate at the creation boundary before streaming or moving Tommy.
     if (!IsVehicleModelInRange(modelId)) {
@@ -2276,6 +2343,44 @@ static void OnProcessScripts() {
                 "You must be inside a vehicle to remove the car bomb"
             );
         }
+    }
+
+    // Apply the Alloy Wheels of Steel opponents' traction to this Angel only.
+    if (keys.godBike && timer - s_keyPressTime > 500) {
+        s_keyPressTime = timer;
+
+        void* vehicle = FindPlayerVehicleFn();
+        // CEntity::m_nModelIndex is a short at +0x5C in VC; Angel is model 166.
+        if (!vehicle || *reinterpret_cast<const short*>(
+            reinterpret_cast<const BYTE*>(vehicle) + 0x5C) != 166) {
+            ShowMessage("You must be riding an Angel");
+        }
+        else {
+            const int handle = GetPlayerVehicleScriptHandle();
+            if (handle != -1) {
+                SetCarTractionScript(handle, 2.0f);
+                ShowMessage("Godbike enabled");
+            }
+            else {
+                ShowMessage("Unable to enable Godbike");
+            }
+        }
+    }
+
+    // Arm the vehicles currently in the live pool, including occupied vehicles.
+    if (keys.rigAllCarBombs && timer - s_keyPressTime > 500) {
+        s_keyPressTime = timer;
+        const int count = RigAllCarBombs();
+        if (count > 0) {
+            RequestModelFn(291, 0);
+            LoadAllRequestedModelsFn(false);
+            GiveWeaponFn(ped, 34, 1, false); // one detonator, not one per vehicle
+            AddOneOffSound(GetPlayerCoors(), 16);
+        }
+
+        char message[64];
+        sprintf_s(message, "Armed %d vehicles", count);
+        ShowMessage(message);
     }
 
     // Mark current vehicle as mission-created.

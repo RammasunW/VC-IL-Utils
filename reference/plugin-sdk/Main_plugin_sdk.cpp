@@ -6,6 +6,8 @@
 
 #include <CModelInfo.h>
 #include <CCarCtrl.h>
+#include <CPools.h>
+#include <eEntityStatus.h>
 #include <RenderWare.h>
 
 
@@ -33,6 +35,8 @@ static int g_keyUnrigBomb = VK_F6;
 static int g_keyMarkVeh = VK_F7;
 static int g_keyUnmarkVeh = VK_F8;
 static int g_keyCarSpawner = VK_F9;
+static int g_keyGodBike = VK_F11;
+static int g_keyRigAllCarBombs = VK_F10;
 
 static char g_iniPath[MAX_PATH];
 
@@ -250,6 +254,15 @@ static void LoadConfig() {
             "F9",
             g_iniPath
         );
+
+        WritePrivateProfileStringA(
+            "Keys",
+            "GodBike",
+            "F11",
+            g_iniPath
+        );
+
+        WritePrivateProfileStringA("Keys", "RigAllCarBombs", "F10", g_iniPath);
     }
 
     g_keySpawnBarrel = ReadKey(
@@ -293,6 +306,9 @@ static void LoadConfig() {
         "F9",
         VK_F9
     );
+
+    g_keyGodBike = ReadKey("Keys", "GodBike", "F11", VK_F11);
+    g_keyRigAllCarBombs = ReadKey("Keys", "RigAllCarBombs", "F10", VK_F10);
 }
 
 // -------
@@ -1385,6 +1401,27 @@ static void Rig(CVehicle* veh) {
     // 11 & 7 = 3
 }
 
+static int RigAllCarBombs() {
+    auto* pool = CPools::ms_pVehiclePool;
+    if (!pool || !pool->m_pObjects || !pool->m_byteMap)
+        return 0;
+
+    int count = 0;
+    for (int i = 0; i < pool->m_nSize; ++i) {
+        CVehicle* vehicle = pool->GetAt(i); // skips empty slots
+        if (!vehicle || vehicle->m_nType != ENTITY_TYPE_VEHICLE ||
+            vehicle->m_nState == STATUS_WRECKED || !(vehicle->m_fHealth > 0.0f) ||
+            !IsVehicleModelInRange(vehicle->m_nModelIndex) ||
+            IsForbiddenSpawnModel(vehicle->m_nModelIndex)) {
+            continue;
+        }
+
+        Rig(vehicle);
+        ++count;
+    }
+    return count;
+}
+
 static void Unrig(CVehicle* veh) {
     veh->field_210 = 0;
 
@@ -1516,6 +1553,40 @@ public:
                     ShowMessage("Car bomb removed");
                 }
                 else ShowMessage("You must be inside a vehicle to remove the car bomb");
+            }
+
+            // Apply the Alloy Wheels of Steel opponents' traction to this Angel only.
+            if (FindPlayerPed() &&
+                KeyPressed(g_keyGodBike) &&
+                CTimer::m_snTimeInMilliseconds - keyPressTime > 500) {
+
+                keyPressTime = CTimer::m_snTimeInMilliseconds;
+                CVehicle* vehicle = FindPlayerVehicle();
+                if (vehicle && vehicle->m_nModelIndex == MODEL_ANGEL) {
+                    Command<Commands::SET_CAR_TRACTION>(vehicle, 2.0f);
+                    ShowMessage("Godbike enabled");
+                }
+                else {
+                    ShowMessage("You must be riding an Angel");
+                }
+            }
+
+            // Arm the vehicles currently in the live pool, including occupied vehicles.
+            if (FindPlayerPed() && KeyPressed(g_keyRigAllCarBombs) &&
+                CTimer::m_snTimeInMilliseconds - keyPressTime > 500) {
+                keyPressTime = CTimer::m_snTimeInMilliseconds;
+                const int count = RigAllCarBombs();
+                if (count > 0) {
+                    CStreaming::RequestModel(291, 0);
+                    CStreaming::LoadAllRequestedModels(false);
+                    FindPlayerPed()->GiveWeapon(WEAPONTYPE_DETONATOR, 1, false);
+                    const CVector pos = FindPlayerCoors();
+                    Command<Commands::ADD_ONE_OFF_SOUND>(pos.x, pos.y, pos.z, 16);
+                }
+
+                char message[64];
+                sprintf_s(message, "Armed %d vehicles", count);
+                ShowMessage(message);
             }
 
             // mark vehicle

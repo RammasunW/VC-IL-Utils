@@ -29,8 +29,28 @@ Default controls:
 | F7 | Mark the current vehicle as a mission vehicle |
 | F8 | Release the current vehicle as a random/traffic vehicle |
 | F9 | Open the vehicle spawner |
+| F10 | Arm all eligible currently loaded vehicles with car bombs |
+| F11 | Enable GodBike on the current Angel |
 
 All keys can be changed through `ILUtilsKeys.ini`.
+
+GodBike applies `SET_CAR_TRACTION 2.0` to the Angel you are currently riding,
+matching the opponent bikes in **Alloy Wheels of Steel**. It does not spawn a
+bike or change the model's handling globally. On foot or in another vehicle,
+the key displays a reminder to ride an Angel. A garage that reconstructs the
+bike can reset its traction.
+
+Existing INI files default to F11 when `GodBike` is absent. Add or edit
+`GodBike=F11` under `[Keys]` to choose another key.
+
+**RigAllCarBombs (F10)** arms eligible vehicles currently in the live vehicle
+pool, including the player's vehicle and occupied traffic. It works on foot
+or in a vehicle, skips unused slots, wrecked/destroyed vehicles, and the
+spawner's unsafe models (including CHOPPER, AIRTRAIN, DEADDODO and RC vehicles).
+It gives one detonator when at least one vehicle is armed and displays
+`Armed N vehicles`. Vehicles loaded afterward require another press.
+Add or edit `RigAllCarBombs=F10` under `[Keys]` to remap it; existing INI files
+use F10 when the entry is absent.
 
 ## Vehicle Spawner
 
@@ -186,6 +206,8 @@ UnrigCarBomb=F6
 MarkVehicle=F7
 UnmarkVehicle=F8
 CarSpawner=F9
+RigAllCarBombs=F10
+GodBike=F11
 ```
 
 Supported key formats include:
