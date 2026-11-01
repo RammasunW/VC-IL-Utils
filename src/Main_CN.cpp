@@ -88,6 +88,10 @@ struct AddrTable {
     DWORD GameTimer;
     DWORD ModelInfoTable;
     DWORD StreamingInfoTable;
+    DWORD RampageTimeLimit;
+    DWORD RampageStatus;
+    DWORD InterestingVehicles;
+    DWORD InterestingVehicleTimes;
 };
 
 static const AddrTable kAddr_INTL = {
@@ -123,7 +127,11 @@ static const AddrTable kAddr_INTL = {
     0xA0FDE4, // CPools::ms_pVehiclePool
     0x974B2C, // CTimer::m_snTimeInMilliseconds
     0x92D4C8, // CModelInfo::ms_modelInfoPtrs[]
-    0x94DDD0  // CStreaming::ms_aInfoForModel[]
+    0x94DDD0, // CStreaming::ms_aInfoForModel[]
+    0x974BE0, // CDarkel::TimeLimit (milliseconds)
+    0xA10A72, // CDarkel::Status; FrenzyOnGoing is Status == 1
+    0x7E9D80, // CCarCtrl interesting vehicle pointers [2]
+    0x94B928  // CCarCtrl interesting vehicle entry times [2], milliseconds
 };
 
 static const AddrTable kAddr_JP = {
@@ -159,7 +167,11 @@ static const AddrTable kAddr_JP = {
     0xA0CDF4, // CPools::ms_pVehiclePool; JP GetVehicle at 0x4BF8E0
     0x971B34, // CTimer::m_snTimeInMilliseconds
     0x92A4D0, // CModelInfo::ms_modelInfoPtrs[]
-    0x94ADD8  // CStreaming::ms_aInfoForModel[]
+    0x94ADD8, // CStreaming::ms_aInfoForModel[]
+    0x971BE8, // CDarkel::TimeLimit (milliseconds)
+    0xA0DA82, // CDarkel::Status; verified JP FrenzyOnGoing at 0x42A360
+    0x7E6D88, // Interesting vehicle pointers [2], matching readCars.ahk
+    0x948930  // Interesting vehicle entry times [2], matching readCars.ahk
 };
 
 static const AddrTable* g_addr = nullptr;
@@ -231,6 +243,8 @@ static int g_keyMissionSelect = VK_F12;
 static int g_keyInfoPanel = VK_OEM_4;
 static int g_keyQuicksave = VK_F5;
 static int g_keyOnMission = VK_F6;
+static int g_keyRampageTimerIncrease = VK_PRIOR;
+static int g_keyRampageTimerDecrease = VK_NEXT;
 
 static char g_iniPath[MAX_PATH];
 
@@ -454,6 +468,8 @@ static void LoadConfig() {
         WritePrivateProfileStringA("Keys", "InfoPanel", "[", g_iniPath);
         WritePrivateProfileStringA("Keys", "Quicksave", "F5", g_iniPath);
         WritePrivateProfileStringA("Keys", "OnMission", "F6", g_iniPath);
+        WritePrivateProfileStringA("Keys", "RampageTimerIncrease", "PGUP", g_iniPath);
+        WritePrivateProfileStringA("Keys", "RampageTimerDecrease", "PGDN", g_iniPath);
     }
 
     g_keySpawnBarrel = ReadKey(
@@ -504,6 +520,8 @@ static void LoadConfig() {
     g_keyInfoPanel = ReadKey("Keys", "InfoPanel", "[", VK_OEM_4);
     g_keyQuicksave = ReadKey("Keys", "Quicksave", "F5", VK_F5);
     g_keyOnMission = ReadKey("Keys", "OnMission", "F6", VK_F6);
+    g_keyRampageTimerIncrease = ReadKey("Keys", "RampageTimerIncrease", "PGUP", VK_PRIOR);
+    g_keyRampageTimerDecrease = ReadKey("Keys", "RampageTimerDecrease", "PGDN", VK_NEXT);
 
     // Never let the bomb key collide with the On Mission key.
     if (g_keyRigBomb == g_keyOnMission)
@@ -523,25 +541,29 @@ struct ActionKeys {
     bool unmarkVehicle;
     bool godBike;
     bool rigAllCarBombs;
+    bool rampageTimerIncrease;
+    bool rampageTimerDecrease;
 };
 
 static bool s_keyWasDown[256] = {};
 
 static ActionKeys ReadActionKeys() {
-    const int keys[7] = {
+    const int keys[9] = {
         g_keySpawnBarrel,
         g_keyRigBomb,
         g_keyUnrigBomb,
         g_keyMarkVeh,
         g_keyUnmarkVeh,
         g_keyGodBike,
-        g_keyRigAllCarBombs
+        g_keyRigAllCarBombs,
+        g_keyRampageTimerIncrease,
+        g_keyRampageTimerDecrease
     };
 
-    bool down[7] = {};
-    bool pressed[7] = {};
+    bool down[9] = {};
+    bool pressed[9] = {};
 
-    for (int i = 0; i < 7; ++i) {
+    for (int i = 0; i < 9; ++i) {
         const int key = keys[i];
         if (key >= 0 && key < 256) {
             down[i] = (GetAsyncKeyState(key) & 0x8000) != 0;
@@ -549,7 +571,7 @@ static ActionKeys ReadActionKeys() {
         }
     }
 
-    for (int i = 0; i < 7; ++i) {
+    for (int i = 0; i < 9; ++i) {
         const int key = keys[i];
         if (key >= 0 && key < 256)
             s_keyWasDown[key] = down[i];
@@ -563,6 +585,8 @@ static ActionKeys ReadActionKeys() {
     result.unmarkVehicle = pressed[4];
     result.godBike = pressed[5];
     result.rigAllCarBombs = pressed[6];
+    result.rampageTimerIncrease = pressed[7];
+    result.rampageTimerDecrease = pressed[8];
     return result;
 }
 
@@ -2812,7 +2836,7 @@ static LRESULT CALLBACK InfoWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
         g_infoText = CreateWindowExA(
             0, "STATIC", "",
             WS_CHILD | WS_VISIBLE | SS_LEFT,
-            8, 8, 336, 150,
+            8, 8, 464, 230,
             hwnd, reinterpret_cast<HMENU>(ID_INFO_TEXT), nullptr, nullptr
         );
         SendMessageA(g_infoText, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
@@ -2821,13 +2845,13 @@ static LRESULT CALLBACK InfoWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
                 reinterpret_cast<LONG_PTR>(InfoTextProc)));
 
         HWND label = CreateWindowExA(0, "STATIC", "坐标 (x, y, z)：",
-            WS_CHILD | WS_VISIBLE, 8, 166, 150, 20, hwnd, nullptr, nullptr, nullptr);
+            WS_CHILD | WS_VISIBLE, 8, 246, 180, 20, hwnd, nullptr, nullptr, nullptr);
         SendMessageA(label, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
 
         g_infoCoordEdit = CreateWindowExA(
             WS_EX_CLIENTEDGE, "EDIT", "",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
-            8, 188, 340, 24, hwnd, reinterpret_cast<HMENU>(3201), nullptr, nullptr);
+            8, 268, 464, 24, hwnd, reinterpret_cast<HMENU>(3201), nullptr, nullptr);
         SendMessageA(g_infoCoordEdit, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
 
         g_infoEditOldProc = reinterpret_cast<WNDPROC>(
@@ -2837,12 +2861,12 @@ static LRESULT CALLBACK InfoWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
 
         HWND teleport = CreateWindowExA(0, "BUTTON", "传送",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
-            8, 220, 160, 30, hwnd, reinterpret_cast<HMENU>(3204), nullptr, nullptr);
+            8, 300, 220, 30, hwnd, reinterpret_cast<HMENU>(3204), nullptr, nullptr);
         SendMessageA(teleport, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
 
         HWND copy = CreateWindowExA(0, "BUTTON", "复制坐标",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-            180, 220, 160, 30, hwnd, reinterpret_cast<HMENU>(3205), nullptr, nullptr);
+            244, 300, 220, 30, hwnd, reinterpret_cast<HMENU>(3205), nullptr, nullptr);
         SendMessageA(copy, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
 
         SendMessageA(g_infoCoordEdit, EM_SETLIMITTEXT, 120, 0);
@@ -2957,7 +2981,7 @@ static void EnsureInfoWindow() {
         WS_EX_TOPMOST,
         "ILUtilsInfoWindow", "VC 信息 (P)",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
-        CW_USEDEFAULT, CW_USEDEFAULT, 372, 300,
+        CW_USEDEFAULT, CW_USEDEFAULT, 496, 380,
         nullptr, nullptr, GetModuleHandleA(nullptr), nullptr
     );
     if (g_infoWindow) {
@@ -3024,6 +3048,62 @@ static int GetWantedLevel() {
     return static_cast<int>(script.localVars[0]);
 }
 
+// Validate a list pointer against live pool slots before reading its fields.
+static bool IsLiveVehiclePointer(void* vehicle) {
+    CPoolRaw* pool = *reinterpret_cast<CPoolRaw**>(g_addr->VehiclePool);
+    if (!vehicle || !pool || !pool->entries || !pool->flags || pool->size <= 0)
+        return false;
+    const uintptr_t ptr = reinterpret_cast<uintptr_t>(vehicle);
+    const uintptr_t base = reinterpret_cast<uintptr_t>(pool->entries);
+    if (ptr < base || (ptr - base) % 0x5DC != 0)
+        return false;
+    const uintptr_t index = (ptr - base) / 0x5DC;
+    return index < static_cast<uintptr_t>(pool->size) && !(pool->flags[index] & 0x80);
+}
+
+static void FormatInterestingVehicleLine(int slot, char* output, size_t capacity) {
+    void* vehicle = reinterpret_cast<void* const*>(g_addr->InterestingVehicles)[slot];
+    const char* name = "无";
+    char fallback[64] = {};
+    unsigned int seconds = 0;
+    if (IsLiveVehiclePointer(vehicle)) {
+        const int model = *reinterpret_cast<const short*>(
+            reinterpret_cast<const BYTE*>(vehicle) + 0x5C);
+        if (model >= 130 && model <= 236) {
+            name = VEHICLE_DISPLAY_NAMES[model - 130];
+        } else {
+            // Preserve support for added vehicle models without unsafe table indexing.
+            void* info = GetModelInfoRaw(model);
+            if (info) {
+                memcpy(fallback, GetModelNameRaw(info), 21);
+            } else {
+                sprintf_s(fallback, "Model %d", model);
+            }
+            name = fallback;
+        }
+        // Entry timestamp, not elapsed time since entry (same as readCars.ahk).
+        seconds = reinterpret_cast<const unsigned int*>(
+            g_addr->InterestingVehicleTimes)[slot] / 1000;
+    }
+    sprintf_s(output, capacity, "二车定律槽位%d: %s [%u秒]", slot + 1, name, seconds);
+}
+
+static void FormatCreatedByLine(void* vehicle, char* output, size_t capacity) {
+    output[0] = '\0';
+    if (!vehicle)
+        return;
+    const BYTE value = VehicleCreatedBy(vehicle);
+    const char* name;
+    switch (value) {
+    case 1: name = "街车"; break;
+    case 2: name = "任务车"; break;
+    case 3: name = "停车场用车"; break;
+    case 4: name = "永久车"; break;
+    default: name = "未知"; break;
+    }
+    sprintf_s(output, capacity, "\r\n车辆来源: %s (%u)", name, static_cast<unsigned int>(value));
+}
+
 static void UpdateInfoPanel() {
     if (!g_infoWindow || !IsWindowVisible(g_infoWindow) || !g_infoText)
         return;
@@ -3079,21 +3159,25 @@ static void UpdateInfoPanel() {
         }
     }
 
-    char buffer[512];
+    char interesting1[160], interesting2[160], createdBy[100];
+    FormatInterestingVehicleLine(0, interesting1, sizeof(interesting1));
+    FormatInterestingVehicleLine(1, interesting2, sizeof(interesting2));
+    FormatCreatedByLine(vehicle, createdBy, sizeof(createdBy));
+    char buffer[1024];
     sprintf_s(buffer,
         "X: %.2f   Y: %.2f   Z: %.2f\r\n"
         "速度: %.1f km/h\r\n"
         "生命: %.1f   护甲: %.1f\r\n"
         "模型: %d   在车内: %s\r\n"
         "通缉: %d\r\n"
-        "任务状态: %s%s",
+        "任务状态: %s%s\r\n%s\r\n%s%s",
         pos.x, pos.y, pos.z,
         speed,
         health, armour,
         static_cast<int>(model), vehicle ? "是" : "否",
         GetWantedLevel(),
         onMission ? "ON" : "OFF",
-        distanceLine);
+        createdBy, interesting1, interesting2, distanceLine);
 
     SetWindowTextA(g_infoText, buffer);
 }
@@ -3175,6 +3259,21 @@ static int s_keyPressTime = 0;
 static void* s_bombedVehicle = nullptr;
 static void* s_markedVehicle = nullptr;
 
+// Adjust only the duration. TimeOfFrenzyStart remains unchanged.
+static void AdjustRampageTimer(int deltaMs) {
+    if (*reinterpret_cast<const short*>(g_addr->RampageStatus) != 1) {
+        ShowMessage("Rampage is not active");
+        return;
+    }
+
+    int& limit = *reinterpret_cast<int*>(g_addr->RampageTimeLimit);
+    const int64_t adjusted = static_cast<int64_t>(limit) + deltaMs;
+    // Avoid negative durations (including the -1 unlimited-time sentinel)
+    // and signed overflow. At zero the game expires the rampage normally.
+    limit = adjusted < 0 ? 0 : adjusted > INT_MAX ? INT_MAX : static_cast<int>(adjusted);
+    ShowMessage(deltaMs > 0 ? "Rampage timer +5s" : "Rampage timer -5s");
+}
+
 static void OnProcessScripts() {
     if (InterlockedCompareExchange(
         &g_spawnerShuttingDown,
@@ -3193,6 +3292,10 @@ static void OnProcessScripts() {
 
     const ActionKeys keys = ReadActionKeys();
     const int timer = *GameTimer;
+
+    // One change per key press; opposite keys together cancel each other.
+    if (keys.rampageTimerIncrease != keys.rampageTimerDecrease)
+        AdjustRampageTimer(keys.rampageTimerIncrease ? 5000 : -5000);
 
     // Mission selector window (F12).
     {
