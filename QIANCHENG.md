@@ -57,4 +57,5 @@ EN uses UTF-8; CN preserves GBK source and execution encoding.
 Outputs and matching configuration files are placed in
 `Release\qiancheng\EN` and `Release\qiancheng\CN`.
 Install one language's ASI beside `gta-vc.exe`; each supports INTL and JP.
-The root `EN` and `CN` ASIs remain the original imported binaries.
+The root `EN` and `CN` ASIs contain the tested rampage and info-panel additions.
+The original imported binaries remain available in commit `32db0f0`.
