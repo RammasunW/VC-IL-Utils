@@ -1,0 +1,10 @@
+Release/
+.vs/
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.user
+VC-LocalUserFiles.log
+userfiles/
