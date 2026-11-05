@@ -16,9 +16,11 @@ if errorlevel 1 exit /b %errorlevel%
 pushd "%~dp0.."
 if not exist Release\qiancheng\EN mkdir Release\qiancheng\EN
 if not exist Release\qiancheng\CN mkdir Release\qiancheng\CN
-cl /nologo /utf-8 /EHsc /W4 /O2 /MT /LD src\Main_EN.cpp /Fo:Release\qiancheng\EN\Main.obj /link /MACHINE:X86 user32.lib comctl32.lib gdi32.lib /OUT:Release\qiancheng\EN\VC-IL-Utils.asi
+rc /nologo /I src\resources /fo Release\qiancheng\map.res src\resources\map.rc
 if errorlevel 1 exit /b %errorlevel%
-cl /nologo /source-charset:.936 /execution-charset:.936 /EHsc /W4 /O2 /MT /LD src\Main_CN.cpp /Fo:Release\qiancheng\CN\Main.obj /link /MACHINE:X86 user32.lib comctl32.lib gdi32.lib /OUT:Release\qiancheng\CN\VC-IL-Utils.asi
+cl /nologo /utf-8 /EHsc /W4 /O2 /MT /LD src\Main_EN.cpp /Fo:Release\qiancheng\EN\Main.obj /link /MACHINE:X86 user32.lib comctl32.lib gdi32.lib Release\qiancheng\map.res /OUT:Release\qiancheng\EN\VC-IL-Utils.asi
+if errorlevel 1 exit /b %errorlevel%
+cl /nologo /source-charset:.936 /execution-charset:.936 /EHsc /W4 /O2 /MT /LD src\Main_CN.cpp /Fo:Release\qiancheng\CN\Main.obj /link /MACHINE:X86 user32.lib comctl32.lib gdi32.lib Release\qiancheng\map.res /OUT:Release\qiancheng\CN\VC-IL-Utils.asi
 if errorlevel 1 exit /b %errorlevel%
 copy /y EN\ILUtilsKeys.ini Release\qiancheng\EN\ILUtilsKeys.ini >nul
 copy /y CN\ILUtilsKeys.ini Release\qiancheng\CN\ILUtilsKeys.ini >nul

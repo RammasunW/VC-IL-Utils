@@ -49,6 +49,19 @@ The panel is enlarged to keep the new lines above the coordinate controls.
 
 ## Building both language versions
 
+Additional local work is documented in `CURSOR_FIX.md`, `MAP_TELEPORT.md`
+and `IME_RC.md`. The RC spawn policy in these local builds permits the four
+RC models with instant entry/exit; the earlier README describes the original
+implementation's stricter blacklist.
+
+The latest contributed update adds the interactive map, with
+[GTA Vice City Interactive Map](https://github.com/denizariyan/GTA-Vice-City-Interactive-Map)
+as its map/teleport reference. The map is opened with `]`; its bitmap is
+embedded in both ASIs. Subsequent local fixes cover tool-window cursor handling,
+short collision-aware teleport landing, game-only IME suppression, safe RC
+entry/exit and NPC RC-door protection. These were tested in-game by the user;
+the INTL multi-monitor setup works with SpeedrunSilentPatch without DxWnd.
+
 Run `src\build.bat` with a Visual Studio C++ x86 toolchain installed.
 An optional argument selects its version, such as `src\build.bat 14.44`.
 Set `QIANCHENG_VS_PATH` to select a specific Visual Studio installation.
@@ -57,5 +70,5 @@ EN uses UTF-8; CN preserves GBK source and execution encoding.
 Outputs and matching configuration files are placed in
 `Release\qiancheng\EN` and `Release\qiancheng\CN`.
 Install one language's ASI beside `gta-vc.exe`; each supports INTL and JP.
-The root `EN` and `CN` ASIs contain the tested rampage and info-panel additions.
+The root `EN` and `CN` ASIs contain the latest local EN/CN builds.
 The original imported binaries remain available in commit `32db0f0`.

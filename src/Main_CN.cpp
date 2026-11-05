@@ -13,8 +13,12 @@
 #pragma comment(lib, "User32.lib")
 #pragma comment(lib, "Comctl32.lib")
 
-static void ForceCursorVisible();
+static void ForceCursorVisible(HWND eventWindow = nullptr, HCURSOR eventCursor = nullptr);
 static bool CursorOverWindow(HWND);
+static void HookChildCursor(HWND parent);
+static void ReleaseGameMouseForTools();
+static bool IsLiveVehiclePointer(void* vehicle);
+static void EnsureGameImePolicy();
 
 static_assert(sizeof(void*) == 4, "Build this ASI as Win32/x86.");
 
@@ -83,6 +87,7 @@ struct AddrTable {
     DWORD HookSiteProcessScripts;
 
     DWORD ScriptSpace;
+    DWORD CodeSelect;
     DWORD ObjectPool;
     DWORD VehiclePool;
     DWORD GameTimer;
@@ -92,6 +97,8 @@ struct AddrTable {
     DWORD RampageStatus;
     DWORD InterestingVehicles;
     DWORD InterestingVehicleTimes;
+    DWORD FindGroundZ;
+    DWORD RequestSceneModels;
 };
 
 static const AddrTable kAddr_INTL = {
@@ -123,6 +130,7 @@ static const AddrTable kAddr_INTL = {
     0x4A45AA, // call site for CTheScripts::Process
 
     0x821280, // CTheScripts::ScriptSpace
+    0x7E3FC8, // code load selector
     0x94DBE0, // CPools::ms_pObjectPool
     0xA0FDE4, // CPools::ms_pVehiclePool
     0x974B2C, // CTimer::m_snTimeInMilliseconds
@@ -131,7 +139,9 @@ static const AddrTable kAddr_INTL = {
     0x974BE0, // CDarkel::TimeLimit (milliseconds)
     0xA10A72, // CDarkel::Status; FrenzyOnGoing is Status == 1
     0x7E9D80, // CCarCtrl interesting vehicle pointers [2]
-    0x94B928  // CCarCtrl interesting vehicle entry times [2], milliseconds
+    0x94B928, // CCarCtrl interesting vehicle entry times [2], milliseconds
+    0x4D53A0, // CWorld::FindGroundZFor3DCoord (with success output)
+    0x40EA10  // CStreaming::AddModelsToRequestList
 };
 
 static const AddrTable kAddr_JP = {
@@ -163,6 +173,7 @@ static const AddrTable kAddr_JP = {
     0x4A3ECA, // call site for CTheScripts::Process
 
     0x81E288, // CTheScripts::ScriptSpace
+    0x7DF5C8, // code load selector
     0x94ABE8, // CPools::ms_pObjectPool
     0xA0CDF4, // CPools::ms_pVehiclePool; JP GetVehicle at 0x4BF8E0
     0x971B34, // CTimer::m_snTimeInMilliseconds
@@ -171,7 +182,9 @@ static const AddrTable kAddr_JP = {
     0x971BE8, // CDarkel::TimeLimit (milliseconds)
     0xA0DA82, // CDarkel::Status; verified JP FrenzyOnGoing at 0x42A360
     0x7E6D88, // Interesting vehicle pointers [2], matching readCars.ahk
-    0x948930  // Interesting vehicle entry times [2], matching readCars.ahk
+    0x948930, // Interesting vehicle entry times [2], matching readCars.ahk
+    0x4D4D10, // verified JP FindGroundZFor3DCoord implementation
+    0x40EDB0  // verified JP AddModelsToRequestList implementation
 };
 
 static const AddrTable* g_addr = nullptr;
@@ -230,6 +243,7 @@ static int* GameTimer = nullptr;
 // -------------------------------------------------------
 // configurable keys
 // -------------------------------------------------------
+
 
 static int g_keySpawnBarrel = VK_F4;
 static int g_keyRigBomb = VK_F8;
@@ -1294,17 +1308,32 @@ static LRESULT CALLBACK SpawnerWindowProc(
     LPARAM lParam
 ) {
     switch (msg) {
+    case WM_MOUSEACTIVATE:
+        ForceCursorVisible(hwnd, LoadCursor(nullptr, IDC_ARROW));
+        return MA_ACTIVATE;
+    case WM_ENTERSIZEMOVE:
+        ForceCursorVisible(hwnd, LoadCursor(nullptr, IDC_ARROW));
+        break;
+
+    case WM_SETCURSOR:
+    {
+        const LRESULT result = DefWindowProcA(hwnd, msg, wParam, lParam);
+        ForceCursorVisible(hwnd, GetCursor());
+        return result;
+    }
+
     case WM_TIMER:
-        if (IsWindowVisible(hwnd) &&
-            (GetForegroundWindow() == hwnd || CursorOverWindow(hwnd)))
+        if (IsWindowVisible(hwnd))
             ForceCursorVisible();
         return 0;
     case WM_ACTIVATE:
-        if (LOWORD(wParam) != WA_INACTIVE)
+        if (LOWORD(wParam) != WA_INACTIVE) {
             ForceCursorVisible();
+        }
         break;
     case WM_CREATE:
     {
+        SetTimer(hwnd, 1, 30, nullptr);
         HFONT font = static_cast<HFONT>(
             GetStockObject(DEFAULT_GUI_FONT)
             );
@@ -1516,7 +1545,7 @@ static void RunSpawnerWindow(const SpawnerThreadContext& context) {
     }
 
     HWND hwnd = CreateWindowExA(
-        WS_EX_TOPMOST | WS_EX_DLGMODALFRAME,
+        WS_EX_DLGMODALFRAME,
         SPAWNER_WINDOW_CLASS,
         "ILUtils 车辆生成器",
         WS_CAPTION | WS_SYSMENU,
@@ -2032,18 +2061,18 @@ static VehicleMatch ResolveVehicleModel(
     return VehicleMatch::Found;
 }
 
+static bool IsRcVehicleModel(int modelId) {
+    return modelId == 171 || modelId == 194 || modelId == 195 || modelId == 231;
+}
+
 static bool IsForbiddenSpawnModel(int modelId) {
     // This spawner always warps Tommy into the driver seat. These models
-    // are scenery/special aircraft or remote-control vehicles, not suitable
+    // are scenery/special aircraft, not suitable
     // for that path. Resolve first so names and numeric IDs share this check.
     switch (modelId) {
     case 165:  // chopper: special police helicopter (not polmav)
-    case 171:  // rcbandit
     case 180:  // airtrain
     case 181:  // deaddodo
-    case 194:  // rcbaron
-    case 195:  // rcraider
-    case 231:  // rcgoblin
         return true;
 
     default:
@@ -2082,7 +2111,7 @@ static int RigAllCarBombs() {
         // CEntity's type/status share +0x50: type in low 3 bits, status above.
         if ((vehicle[0x50] & 7) != 2 || (vehicle[0x50] >> 3) == 5 ||
             !(*reinterpret_cast<const float*>(vehicle + 0x204) > 0.0f) ||
-            !IsVehicleModelInRange(model) || IsForbiddenSpawnModel(model)) {
+            !IsVehicleModelInRange(model) || IsRcVehicleModel(model) || IsForbiddenSpawnModel(model)) {
             continue;
         }
 
@@ -2509,10 +2538,61 @@ static void PlaceOnGameMonitor(HWND wnd, int dx, int dy) {
     }
 }
 
-static void ForceCursorVisible() {
+static bool IsToolWindow(HWND window) {
+    if (!window)
+        return false;
+    HWND root = GetAncestor(window, GA_ROOT);
+    DWORD process = 0;
+    GetWindowThreadProcessId(root, &process);
+    if (process != GetCurrentProcessId() || !IsWindowVisible(root))
+        return false;
+    char name[80] = {};
+    GetClassNameA(root, name, sizeof(name));
+    return strcmp(name, "ILUtilsVehicleSpawnerWindow") == 0 ||
+        strcmp(name, "ILUtilsMissionWindow") == 0 ||
+        strcmp(name, "ILUtilsSaveWindow") == 0 ||
+        strcmp(name, "ILUtilsInfoWindow") == 0 ||
+        strcmp(name, "ILUtilsMapWindow") == 0;
+}
+
+// Physical desktop coordinates avoid DPI virtualization between monitors.
+static HWND ToolWindowUnderPointer() {
+    POINT point;
+    if (!GetPhysicalCursorPos(&point))
+        return nullptr;
+    return WindowFromPhysicalPoint(point);
+}
+
+static void ForceCursorVisible(HWND eventWindow, HCURSOR eventCursor) {
+    HWND target = eventWindow;
+    if (!IsToolWindow(target))
+        target = GetCapture();
+    if (!IsToolWindow(target))
+        target = ToolWindowUnderPointer();
+    if (!IsToolWindow(target) ||
+        GetWindowThreadProcessId(target, nullptr) != GetCurrentThreadId())
+        return;
+
+    ReleaseGameMouseForTools();
     ClipCursor(nullptr);
-    while (ShowCursor(TRUE) < 0) {}
-    SetCursor(LoadCursor(nullptr, IDC_ARROW));
+    // Keep a window-thread cursor; GetCursorInfo describes the global cursor
+    // and can remain non-null while the game has cleared this thread's cursor.
+    static thread_local HCURSOR lastToolCursor = nullptr;
+    if (eventCursor)
+        lastToolCursor = eventCursor;
+    HCURSOR cursor = eventCursor ? eventCursor : GetCursor();
+    if (!cursor)
+        cursor = lastToolCursor ? lastToolCursor : LoadCursor(nullptr, IDC_ARROW);
+    // Reapply even when a global cursor handle already exists. The tool may
+    // now be on a different display from the game's rendering device.
+    SetCursor(cursor);
+
+    int count = ShowCursor(TRUE);
+    if (count > 0)
+        ShowCursor(FALSE);
+    else
+        while (count < 0)
+            count = ShowCursor(TRUE);
 }
 
 static void HideWindowAndCursor(HWND wnd);
@@ -2524,14 +2604,28 @@ static LRESULT CALLBACK MissionWndProc(
     LPARAM lParam
 ) {
     switch (msg) {
+    case WM_MOUSEACTIVATE:
+        ForceCursorVisible(hwnd, LoadCursor(nullptr, IDC_ARROW));
+        return MA_ACTIVATE;
+    case WM_ENTERSIZEMOVE:
+        ForceCursorVisible(hwnd, LoadCursor(nullptr, IDC_ARROW));
+        break;
+
+    case WM_SETCURSOR:
+    {
+        const LRESULT result = DefWindowProcA(hwnd, msg, wParam, lParam);
+        ForceCursorVisible(hwnd, GetCursor());
+        return result;
+    }
+
     case WM_TIMER:
-        if (IsWindowVisible(hwnd) &&
-            (GetForegroundWindow() == hwnd || CursorOverWindow(hwnd)))
+        if (IsWindowVisible(hwnd))
             ForceCursorVisible();
         return 0;
     case WM_ACTIVATE:
-        if (LOWORD(wParam) != WA_INACTIVE)
+        if (LOWORD(wParam) != WA_INACTIVE) {
             ForceCursorVisible();
+        }
         break;
     case WM_CREATE:
     {
@@ -2594,7 +2688,6 @@ static LRESULT CALLBACK MissionWndProc(
             );
             if (sel >= 0) {
                 InterlockedExchange(&g_pendingMission, sel);
-                ShowWindow(hwnd, SW_HIDE);
             }
             return 0;
         }
@@ -2610,7 +2703,6 @@ static LRESULT CALLBACK MissionWndProc(
             );
             if (sel >= 0) {
                 InterlockedExchange(&g_pendingMission, sel);
-                ShowWindow(hwnd, SW_HIDE);
             }
             return 0;
         }
@@ -2646,7 +2738,7 @@ static void EnsureMissionWindow() {
     }
 
     g_missionWindow = CreateWindowExA(
-        WS_EX_TOPMOST,
+        0,
         "ILUtilsMissionWindow",
         "任务选择 (F12)",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
@@ -2658,6 +2750,7 @@ static void EnsureMissionWindow() {
     );
 
     if (g_missionWindow) {
+        HookChildCursor(g_missionWindow);
         SetTimer(g_missionWindow, 1, 30, nullptr);
         HideWindowAndCursor(g_missionWindow);
     }
@@ -2667,10 +2760,9 @@ static void EnsureMissionWindow() {
 static void HideWindowAndCursor(HWND wnd) {
     if (!wnd)
         return;
-    KillTimer(wnd, 1);
     ShowWindow(wnd, SW_HIDE);
-    // Hand the cursor back to the game instead of leaving it on screen.
-    while (ShowCursor(FALSE) >= 0) {}
+    // Other tool windows may still need the cursor after this one is hidden.
+    // Cursor visibility belongs to the hovered window, not the window being hidden.
 }
 
 static void ToggleMissionWindow() {
@@ -2686,7 +2778,7 @@ static void ToggleMissionWindow() {
         ShowWindow(g_missionWindow, SW_SHOWNOACTIVATE);
         SetWindowPos(
             g_missionWindow,
-            HWND_TOPMOST,
+            HWND_TOP,
             0, 0, 0, 0,
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW
         );
@@ -2723,6 +2815,338 @@ static bool ParseCoordText(const char* text, float* x, float* y, float* z) {
 
     return sscanf_s(buffer, "%f %f %f", x, y, z) == 3;
 }
+
+
+
+// -------------------------------------------------------
+// Interactive map ( ] ): click to teleport, vehicle included
+// -------------------------------------------------------
+
+static void TeleportToWorld(float x, float y, float z) {
+    void* vehicle = FindPlayerVehicleFn();
+    if (vehicle) {
+        const int handle = GetPlayerVehicleScriptHandle();
+        if (handle == -1)
+            return;
+
+        ScriptCode code(0x00AB);
+        code.AddInt(handle);
+        code.AddFloat(x);
+        code.AddFloat(y);
+        code.AddFloat(z);
+        RunScriptCode(code);
+    } else {
+        ScriptCode code(0x0055);
+        code.AddInt(0);
+        code.AddFloat(x);
+        code.AddFloat(y);
+        code.AddFloat(z);
+        RunScriptCode(code);
+    }
+}
+
+#define IDR_MAP_IMAGE 101
+
+static HWND g_mapWindow = nullptr;
+static HBITMAP g_mapBmp = nullptr;
+static float g_mapZoom = 1.0f;
+static int g_mapPanX = 0;
+static int g_mapPanY = 0;
+static bool g_mapDragging = false;
+static POINT g_mapDragLast = { 0, 0 };
+static bool g_mapLDown = false;
+static bool g_mapLMoved = false;
+static POINT g_mapLStart = { 0, 0 };
+
+static void MapClampPan() {
+    if (!g_mapWindow)
+        return;
+
+    RECT rc;
+    GetClientRect(g_mapWindow, &rc);
+
+    const int w = (int)(726 * g_mapZoom);
+    const int h = (int)(924 * g_mapZoom);
+
+    if (w <= rc.right) {
+        g_mapPanX = (rc.right - w) / 2;
+    } else {
+        if (g_mapPanX > 0) g_mapPanX = 0;
+        if (g_mapPanX < rc.right - w) g_mapPanX = rc.right - w;
+    }
+
+    if (h <= rc.bottom) {
+        g_mapPanY = (rc.bottom - h) / 2;
+    } else {
+        if (g_mapPanY > 0) g_mapPanY = 0;
+        if (g_mapPanY < rc.bottom - h) g_mapPanY = rc.bottom - h;
+    }
+}
+
+static void MapTeleport(float x, float y);
+
+static LRESULT CALLBACK MapWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+    case WM_MOUSEACTIVATE:
+        ForceCursorVisible(hwnd, LoadCursor(nullptr, IDC_ARROW));
+        return MA_ACTIVATE;
+    case WM_ENTERSIZEMOVE:
+        ForceCursorVisible(hwnd, LoadCursor(nullptr, IDC_ARROW));
+        break;
+
+    case WM_SETCURSOR:
+    {
+        const LRESULT result = DefWindowProcA(hwnd, msg, wParam, lParam);
+        ForceCursorVisible(hwnd, GetCursor());
+        return result;
+    }
+
+    case WM_TIMER:
+        ForceCursorVisible();
+        return 0;
+    case WM_CREATE:
+    {
+        HMODULE self = nullptr;
+        GetModuleHandleExA(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCSTR>(&MapWndProc), &self);
+
+        g_mapBmp = static_cast<HBITMAP>(
+            LoadImageA(self, MAKEINTRESOURCEA(IDR_MAP_IMAGE), IMAGE_BITMAP, 0, 0, 0));
+
+        g_mapZoom = 1.0f;
+        MapClampPan();
+        return 0;
+    }
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_PAINT:
+    {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(hwnd, &ps);
+
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+
+        if (rc.right <= 0 || rc.bottom <= 0) {
+            EndPaint(hwnd, &ps);
+            return 0;
+        }
+
+        HDC buf = CreateCompatibleDC(dc);
+        HBITMAP back = CreateCompatibleBitmap(dc, rc.right, rc.bottom);
+        HGDIOBJ oldBack = SelectObject(buf, back);
+
+        HBRUSH bg = reinterpret_cast<HBRUSH>(COLOR_BTNFACE + 1);
+        FillRect(buf, &rc, bg);
+
+        if (g_mapBmp) {
+            HDC mem = CreateCompatibleDC(dc);
+            HGDIOBJ old = SelectObject(mem, g_mapBmp);
+
+            const int w = (int)(726 * g_mapZoom);
+            const int h = (int)(924 * g_mapZoom);
+
+            SetStretchBltMode(buf, HALFTONE);
+            SetBrushOrgEx(buf, 0, 0, nullptr);
+            StretchBlt(buf, g_mapPanX, g_mapPanY, w, h, mem, 0, 0, 726, 924, SRCCOPY);
+
+            SelectObject(mem, old);
+            DeleteDC(mem);
+        }
+
+        BitBlt(dc, 0, 0, rc.right, rc.bottom, buf, 0, 0, SRCCOPY);
+
+        SelectObject(buf, oldBack);
+        DeleteObject(back);
+        DeleteDC(buf);
+
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+
+    case WM_MOUSEWHEEL:
+    {
+        POINT pt; pt.x = (short)LOWORD(lParam); pt.y = (short)HIWORD(lParam);
+        ScreenToClient(hwnd, &pt);
+
+        const float oldZoom = g_mapZoom;
+        const int delta = GET_WHEEL_DELTA_WPARAM(wParam);
+
+        if (delta > 0)
+            g_mapZoom *= 1.25f;
+        else
+            g_mapZoom /= 1.25f;
+
+        if (g_mapZoom < 1.0f) g_mapZoom = 1.0f;
+        if (g_mapZoom > 8.0f) g_mapZoom = 8.0f;
+
+        const float ratio = g_mapZoom / oldZoom;
+        g_mapPanX = pt.x - (int)((pt.x - g_mapPanX) * ratio);
+        g_mapPanY = pt.y - (int)((pt.y - g_mapPanY) * ratio);
+
+        MapClampPan();
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+    }
+    case WM_LBUTTONDOWN:
+        g_mapLDown = true;
+        g_mapLMoved = false;
+        g_mapLStart.x = LOWORD(lParam);
+        g_mapLStart.y = HIWORD(lParam);
+        g_mapDragLast = g_mapLStart;
+        SetCapture(hwnd);
+        return 0;
+    case WM_LBUTTONUP:
+    {
+        const bool hadPress = g_mapLDown;
+        const bool moved = g_mapLMoved;
+        g_mapLDown = false;
+        g_mapLMoved = false;
+        ReleaseCapture();
+
+        if (!hadPress || moved)
+            return 0;
+
+        const int px = LOWORD(lParam);
+        const int py = HIWORD(lParam);
+
+        const int imgX = (int)((px - g_mapPanX) / g_mapZoom);
+        const int imgY = (int)((py - g_mapPanY) / g_mapZoom);
+
+        if (imgX < 0 || imgX >= 726 || imgY < 0 || imgY >= 924)
+            return 0;
+
+        const float wx = -(478.0f - imgX) * 3.91232329951f;
+        const float wy = (414.0f - imgY) * 3.91232329951f;
+
+        MapTeleport(wx, wy);
+        return 0;
+    }
+    case WM_CAPTURECHANGED:
+    case WM_CANCELMODE:
+        g_mapDragging = false;
+        g_mapLDown = false;
+        g_mapLMoved = false;
+        return 0;
+    case WM_RBUTTONDOWN:
+        g_mapDragging = true;
+        g_mapDragLast.x = LOWORD(lParam);
+        g_mapDragLast.y = HIWORD(lParam);
+        SetCapture(hwnd);
+        return 0;
+    case WM_RBUTTONUP:
+        g_mapDragging = false;
+        ReleaseCapture();
+        return 0;
+    case WM_MOUSELEAVE:
+        // Cursor visibility belongs to the hovered window, not the window being hidden.
+        break;
+    case WM_MOUSEMOVE:
+        ForceCursorVisible();
+        {
+            TRACKMOUSEEVENT tme = {};
+            tme.cbSize = sizeof(tme);
+            tme.dwFlags = TME_LEAVE;
+            tme.hwndTrack = hwnd;
+            TrackMouseEvent(&tme);
+        }
+        if (g_mapDragging) {
+            const int x = LOWORD(lParam);
+            const int y = HIWORD(lParam);
+            g_mapPanX += x - g_mapDragLast.x;
+            g_mapPanY += y - g_mapDragLast.y;
+            g_mapDragLast.x = x;
+            g_mapDragLast.y = y;
+            MapClampPan();
+            InvalidateRect(hwnd, nullptr, FALSE);
+        }
+        if (g_mapLDown) {
+            const int x = LOWORD(lParam);
+            const int y = HIWORD(lParam);
+            const int dx = x - g_mapLStart.x;
+            const int dy = y - g_mapLStart.y;
+            if (abs(dx) > 3 || abs(dy) > 3)
+                g_mapLMoved = true;
+            if (g_mapLMoved) {
+                g_mapPanX += x - g_mapDragLast.x;
+                g_mapPanY += y - g_mapDragLast.y;
+                MapClampPan();
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
+            g_mapDragLast.x = x;
+            g_mapDragLast.y = y;
+        }
+        return 0;
+    case WM_CLOSE:
+        ShowWindow(hwnd, SW_HIDE);
+        return 0;
+    }
+    return DefWindowProcA(hwnd, msg, wParam, lParam);
+}
+
+static void ToggleMapWindow() {
+    if (!g_mapWindow || !IsWindow(g_mapWindow)) {
+        static bool registered = false;
+        if (!registered) {
+            WNDCLASSA wc = {};
+            wc.lpfnWndProc = MapWndProc;
+            wc.hInstance = GetModuleHandleA(nullptr);
+            wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+            wc.hbrBackground = nullptr;
+            wc.lpszClassName = "ILUtilsMapWindow";
+            if (!RegisterClassA(&wc))
+                return;
+            registered = true;
+        }
+
+        g_mapWindow = CreateWindowExA(
+            WS_EX_COMPOSITED,
+            "ILUtilsMapWindow", "VC Map - click to teleport",
+            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
+            CW_USEDEFAULT, CW_USEDEFAULT, 742, 963,
+            nullptr, nullptr, GetModuleHandleA(nullptr), nullptr);
+    }
+
+    if (!g_mapWindow)
+        return;
+
+    if (IsWindowVisible(g_mapWindow)) {
+        KillTimer(g_mapWindow, 1);
+        ShowWindow(g_mapWindow, SW_HIDE);
+        // Cursor visibility belongs to the hovered window, not the window being hidden.
+    } else {
+        SetTimer(g_mapWindow, 1, 30, nullptr);
+        ShowWindow(g_mapWindow, SW_SHOWNOACTIVATE);
+        SetWindowPos(g_mapWindow, HWND_TOP, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    }
+}
+
+
+#include "map_teleport.h"
+
+// Subclassing composes with the existing edit and draggable text handlers.
+static LRESULT CALLBACK ChildHoverProc(HWND hwnd, UINT msg, WPARAM wParam,
+    LPARAM lParam, UINT_PTR id, DWORD_PTR) {
+    if (msg == WM_NCDESTROY)
+        RemoveWindowSubclass(hwnd, ChildHoverProc, id);
+    const LRESULT result = DefSubclassProc(hwnd, msg, wParam, lParam);
+    if (msg == WM_SETCURSOR || msg == WM_MOUSEMOVE)
+        ForceCursorVisible(hwnd, msg == WM_SETCURSOR ? GetCursor() : nullptr);
+    return result;
+}
+
+static BOOL CALLBACK HookChildCallback(HWND child, LPARAM) {
+    SetWindowSubclass(child, ChildHoverProc, 2, 0);
+    return TRUE;
+}
+
+static void HookChildCursor(HWND parent) {
+    if (parent)
+        EnumChildWindows(parent, HookChildCallback, 0);
+}
+
 
 static void DoTeleport() {
     if (!g_infoCoordEdit)
@@ -2818,16 +3242,73 @@ static LRESULT CALLBACK InfoTextProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM 
     return CallWindowProcA(g_infoTextOldProc, hwnd, msg, wParam, lParam);
 }
 
+
+// SSU（脚本空间内的 clerk timer）：0x821FE8 - 0x821280 = 0xD68，
+// 1.1 / Steam / 日版相对 ScriptSpace 的偏移相同。
+#define SSU_OFFSET 0xD68
+
+static int* SSUAddress() {
+    return reinterpret_cast<int*>(
+        reinterpret_cast<BYTE*>(g_addr->ScriptSpace) + SSU_OFFSET);
+}
+
+static void ApplySSUFromEdit(HWND hwnd) {
+    HWND edit = GetDlgItem(hwnd, 3206);
+    if (!edit)
+        return;
+
+    char text[64] = {};
+    GetWindowTextA(edit, text, sizeof(text));
+
+    int value = atoi(text);
+    *SSUAddress() = value;
+
+    char message[64];
+    sprintf_s(message, "半径时间已设为 %d", value);
+    ShowMessage(message);
+}
+
+
+static void ApplyCodeFromEdit(HWND hwnd) {
+    HWND edit = GetDlgItem(hwnd, 3208);
+    if (!edit)
+        return;
+
+    char text[64] = {};
+    GetWindowTextA(edit, text, sizeof(text));
+
+    int value = atoi(text);
+    *reinterpret_cast<int*>(g_addr->CodeSelect) = value;
+
+    char message[64];
+    sprintf_s(message, "代码偏移已设为 %d", value);
+    ShowMessage(message);
+}
+
 static LRESULT CALLBACK InfoWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
+    case WM_MOUSEACTIVATE:
+        ForceCursorVisible(hwnd, LoadCursor(nullptr, IDC_ARROW));
+        return MA_ACTIVATE;
+    case WM_ENTERSIZEMOVE:
+        ForceCursorVisible(hwnd, LoadCursor(nullptr, IDC_ARROW));
+        break;
+
+    case WM_SETCURSOR:
+    {
+        const LRESULT result = DefWindowProcA(hwnd, msg, wParam, lParam);
+        ForceCursorVisible(hwnd, GetCursor());
+        return result;
+    }
+
     case WM_TIMER:
-        if (IsWindowVisible(hwnd) &&
-            (GetForegroundWindow() == hwnd || CursorOverWindow(hwnd)))
+        if (IsWindowVisible(hwnd))
             ForceCursorVisible();
         return 0;
     case WM_ACTIVATE:
-        if (LOWORD(wParam) != WA_INACTIVE)
+        if (LOWORD(wParam) != WA_INACTIVE) {
             ForceCursorVisible();
+        }
         break;
     case WM_CREATE:
     {
@@ -2869,6 +3350,36 @@ static LRESULT CALLBACK InfoWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
             244, 300, 220, 30, hwnd, reinterpret_cast<HMENU>(3205), nullptr, nullptr);
         SendMessageA(copy, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
 
+        HWND ssuLabel = CreateWindowExA(0, "STATIC", "SSU半径时间:",
+            WS_CHILD | WS_VISIBLE, 8, 340, 110, 20, hwnd, nullptr, nullptr, nullptr);
+        SendMessageA(ssuLabel, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+
+        HWND ssuEdit = CreateWindowExA(
+            WS_EX_CLIENTEDGE, "EDIT", "",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL | ES_NUMBER,
+            120, 336, 180, 24, hwnd, reinterpret_cast<HMENU>(3206), nullptr, nullptr);
+        SendMessageA(ssuEdit, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+
+        HWND ssuButton = CreateWindowExA(0, "BUTTON", "设置半径时间",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+            306, 334, 168, 28, hwnd, reinterpret_cast<HMENU>(3207), nullptr, nullptr);
+        SendMessageA(ssuButton, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+
+        HWND codeLabel = CreateWindowExA(0, "STATIC", "代码偏移:",
+            WS_CHILD | WS_VISIBLE, 8, 374, 110, 20, hwnd, nullptr, nullptr, nullptr);
+        SendMessageA(codeLabel, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+
+        HWND codeEdit = CreateWindowExA(
+            WS_EX_CLIENTEDGE, "EDIT", "",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL | ES_NUMBER,
+            120, 370, 180, 24, hwnd, reinterpret_cast<HMENU>(3208), nullptr, nullptr);
+        SendMessageA(codeEdit, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+
+        HWND codeButton = CreateWindowExA(0, "BUTTON", "设置偏移",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+            306, 368, 168, 28, hwnd, reinterpret_cast<HMENU>(3209), nullptr, nullptr);
+        SendMessageA(codeButton, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+
         SendMessageA(g_infoCoordEdit, EM_SETLIMITTEXT, 120, 0);
         return 0;
     }
@@ -2884,6 +3395,16 @@ static LRESULT CALLBACK InfoWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
 
         if (id == 3205) {
             CopyCurrentCoords(hwnd);
+            return 0;
+        }
+
+        if (id == 3207 && HIWORD(wParam) == BN_CLICKED) {
+            ApplySSUFromEdit(hwnd);
+            return 0;
+        }
+
+        if (id == 3209 && HIWORD(wParam) == BN_CLICKED) {
+            ApplyCodeFromEdit(hwnd);
             return 0;
         }
         break;
@@ -2907,14 +3428,28 @@ static LRESULT CALLBACK InfoWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
 
 static LRESULT CALLBACK SaveWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
+    case WM_MOUSEACTIVATE:
+        ForceCursorVisible(hwnd, LoadCursor(nullptr, IDC_ARROW));
+        return MA_ACTIVATE;
+    case WM_ENTERSIZEMOVE:
+        ForceCursorVisible(hwnd, LoadCursor(nullptr, IDC_ARROW));
+        break;
+
+    case WM_SETCURSOR:
+    {
+        const LRESULT result = DefWindowProcA(hwnd, msg, wParam, lParam);
+        ForceCursorVisible(hwnd, GetCursor());
+        return result;
+    }
+
     case WM_TIMER:
-        if (IsWindowVisible(hwnd) &&
-            (GetForegroundWindow() == hwnd || CursorOverWindow(hwnd)))
+        if (IsWindowVisible(hwnd))
             ForceCursorVisible();
         return 0;
     case WM_ACTIVATE:
-        if (LOWORD(wParam) != WA_INACTIVE)
+        if (LOWORD(wParam) != WA_INACTIVE) {
             ForceCursorVisible();
+        }
         break;
     case WM_CREATE:
     {
@@ -2978,13 +3513,14 @@ static void EnsureInfoWindow() {
     }
 
     g_infoWindow = CreateWindowExA(
-        WS_EX_TOPMOST,
+        0,
         "ILUtilsInfoWindow", "VC 信息 (P)",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
-        CW_USEDEFAULT, CW_USEDEFAULT, 496, 380,
+        CW_USEDEFAULT, CW_USEDEFAULT, 496, 480,
         nullptr, nullptr, GetModuleHandleA(nullptr), nullptr
     );
     if (g_infoWindow) {
+        HookChildCursor(g_infoWindow);
         SetTimer(g_infoWindow, 1, 30, nullptr);
         HideWindowAndCursor(g_infoWindow);
     }
@@ -3000,7 +3536,7 @@ static void ToggleInfoPanel() {
     } else {
         PlaceOnGameMonitor(g_infoWindow, 420, 60);
         ShowWindow(g_infoWindow, SW_SHOWNOACTIVATE);
-        SetWindowPos(g_infoWindow, HWND_TOPMOST, 0, 0, 0, 0,
+        SetWindowPos(g_infoWindow, HWND_TOP, 0, 0, 0, 0,
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
     }
 }
@@ -3021,7 +3557,7 @@ static void OpenSaveWindow() {
 
     if (!g_saveWindow || !IsWindow(g_saveWindow)) {
         g_saveWindow = CreateWindowExA(
-            WS_EX_TOPMOST,
+            0,
             "ILUtilsSaveWindow", "快速存档 - 选择槽位",
             WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
             CW_USEDEFAULT, CW_USEDEFAULT, 310, 260,
@@ -3030,11 +3566,12 @@ static void OpenSaveWindow() {
     }
 
     if (g_saveWindow) {
+        HookChildCursor(g_saveWindow);
         if (!IsWindowVisible(g_saveWindow))
             PlaceOnGameMonitor(g_saveWindow, 470, 140);
         SetTimer(g_saveWindow, 1, 30, nullptr);
         ShowWindow(g_saveWindow, SW_SHOWNOACTIVATE);
-        SetWindowPos(g_saveWindow, HWND_TOPMOST, 0, 0, 0, 0,
+        SetWindowPos(g_saveWindow, HWND_TOP, 0, 0, 0, 0,
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
     }
 }
@@ -3170,12 +3707,16 @@ static void UpdateInfoPanel() {
         "生命: %.1f   护甲: %.1f\r\n"
         "模型: %d   在车内: %s\r\n"
         "通缉: %d\r\n"
+        "SSU半径时间: %d\r\n"
+        "代码偏移: %d\r\n"
         "任务状态: %s%s\r\n%s\r\n%s%s",
         pos.x, pos.y, pos.z,
         speed,
         health, armour,
         static_cast<int>(model), vehicle ? "是" : "否",
         GetWantedLevel(),
+        *SSUAddress(),
+        *reinterpret_cast<int*>(g_addr->CodeSelect),
         onMission ? "ON" : "OFF",
         createdBy, interesting1, interesting2, distanceLine);
 
@@ -3224,21 +3765,7 @@ static void ToggleOnMission() {
 
 
 static bool CursorOverToolWindow() {
-    POINT pt;
-    if (!GetCursorPos(&pt))
-        return false;
-
-    HWND hovered = WindowFromPoint(pt);
-    if (!hovered)
-        return false;
-
-    HWND windows[3] = { g_missionWindow, g_saveWindow, g_infoWindow };
-    for (int i = 0; i < 3; ++i) {
-        HWND w = windows[i];
-        if (w && IsWindowVisible(w) && (hovered == w || IsChild(w, hovered)))
-            return true;
-    }
-    return false;
+    return IsToolWindow(ToolWindowUnderPointer());
 }
 
 
@@ -3274,7 +3801,10 @@ static void AdjustRampageTimer(int deltaMs) {
     ShowMessage(deltaMs > 0 ? "Rampage timer +5s" : "Rampage timer -5s");
 }
 
+
+
 static void OnProcessScripts() {
+    EnsureGameImePolicy();
     if (InterlockedCompareExchange(
         &g_spawnerShuttingDown,
         0,
@@ -3287,8 +3817,10 @@ static void OnProcessScripts() {
 
     void* ped = FindPlayerPedFn();
 
-    if (!ped)
+    if (!ped) {
+        MapTeleportState::Cancel();
         return;
+    }
 
     const ActionKeys keys = ReadActionKeys();
     const int timer = *GameTimer;
@@ -3323,6 +3855,12 @@ static void OnProcessScripts() {
         const bool saveDown = (GetAsyncKeyState(g_keyQuicksave) & 0x8000) != 0;
         const bool omDown = (GetAsyncKeyState(g_keyOnMission) & 0x8000) != 0;
 
+        static bool mapKeyWasDown = false;
+        const bool mapKeyDown = (GetAsyncKeyState(VK_OEM_6) & 0x8000) != 0;
+        if (mapKeyDown && !mapKeyWasDown)
+            ToggleMapWindow();
+        mapKeyWasDown = mapKeyDown;
+
         if (infoDown && !infoWasDown)
             ToggleInfoPanel();
         if (saveDown && !saveWasDown)
@@ -3334,14 +3872,15 @@ static void OnProcessScripts() {
         saveWasDown = saveDown;
         omWasDown = omDown;
 
+
+        UpdatePendingTeleport();
+
         UpdateInfoPanel();
 
         // 游戏会持续 ShowCursor(FALSE) 并 ClipCursor 到自己窗口；
         // 只要鼠标落在我们的任意弹窗上，就强制恢复指针。
         if (CursorOverToolWindow()) {
-            ClipCursor(nullptr);
-            while (ShowCursor(TRUE) < 0) {}
-            SetCursor(LoadCursor(nullptr, IDC_ARROW));
+            ForceCursorVisible();
         }
         const LONG slot = InterlockedExchange(&g_pendingSaveSlot, -1);
         if (slot > 0)
@@ -3614,6 +4153,11 @@ static void InitFunctionPointers() {
 // Entry point
 // -------------------------------------------------------
 
+#include "tool_mouse_hooks.h"
+#include "tool_directinput.h"
+#include "game_ime.h"
+#include "rc_vehicle.h"
+
 BOOL APIENTRY DllMain(
     HMODULE hModule,
     DWORD reason,
@@ -3647,6 +4191,30 @@ BOOL APIENTRY DllMain(
         InitFunctionPointers();
         LoadConfig();
 
+        if (!ToolMouseHooks::Install(GetModuleHandleA(nullptr))) {
+            MessageBoxA(nullptr, "ILUtils: failed to install game mouse ownership hooks.",
+                "ILUtils", MB_OK | MB_ICONERROR);
+            return FALSE;
+        }
+
+        // JP already handles this interaction correctly. Do not infer a JP
+        // input address: this additional interception is INTL-only.
+        if (g_version == VER_INTL_10 &&
+            !ToolDirectInput::Install(0x5FF290, 0x9B48F4, 0x601740)) {
+            ToolMouseHooks::Remove();
+            MessageBoxA(nullptr, "ILUtils: unsupported or already patched INTL mouse reader.",
+                "ILUtils", MB_OK | MB_ICONERROR);
+            return FALSE;
+        }
+
+        if (!RcVehicleHooks::Install(g_version)) {
+            ToolDirectInput::Remove();
+            ToolMouseHooks::Remove();
+            MessageBoxA(nullptr, "ILUtils: cannot install RC entry/exit safeguards.",
+                "ILUtils", MB_OK | MB_ICONERROR);
+            return FALSE;
+        }
+
         if (!PatchCall(
             g_addr->HookSiteProcessScripts,
             reinterpret_cast<void*>(
@@ -3660,10 +4228,19 @@ BOOL APIENTRY DllMain(
                 "ILUtils",
                 MB_OK | MB_ICONERROR
             );
+            RcVehicleHooks::Remove();
+            ToolDirectInput::Remove();
+            ToolMouseHooks::Remove();
             return FALSE;
         }
     }
 
+    if (reason == DLL_PROCESS_DETACH) {
+        GameIme::Remove();
+        RcVehicleHooks::Remove();
+        ToolDirectInput::Remove();
+        ToolMouseHooks::Remove();
+    }
     return TRUE;
 }
 

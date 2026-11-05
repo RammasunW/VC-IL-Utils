@@ -6,6 +6,44 @@ VC-IL-Utils provides several gameplay and debugging utilities, including an inte
 
 The main implementation is a standalone Win32/x86 ASI and does **not** require plugin-sdk to build or run.
 
+## qiancheng branch
+
+This branch includes qiancheng's English and Chinese interfaces, quick save,
+OnMission toggle, mission selector, information panel, and interactive map.
+Mark/unmark and rig/unrig each use a single toggle key.
+
+| Default key | Action |
+| --- | --- |
+| F4 | Spawn an explosive barrel |
+| F5 | Quick save |
+| F6 | Toggle OnMission |
+| F7 | Toggle vehicle mission marking |
+| F8 | Toggle the current vehicle's car bomb |
+| F9 | Vehicle spawner |
+| F10 | Rig all eligible loaded vehicles |
+| F11 | GodBike for the current Angel |
+| F12 | Mission selector |
+| [ | Information panel |
+| ] | Map and click-to-teleport |
+| PgUp / PgDn | Add / remove 5 seconds from an active rampage |
+
+The panel includes both interesting-vehicle slots, entry timestamps and the
+current vehicle's CreatedBy category. Map teleportation briefly waits for
+ground collision, with a short sea-level fallback. RC vehicles support instant
+entry/exit and have guards against NPC door interactions. The game window's
+IME is disabled while tool windows retain normal text input.
+
+Build and installation details: [QIANCHENG.md](QIANCHENG.md).
+Implementation notes: [cursor](CURSOR_FIX.md), [teleportation](MAP_TELEPORT.md),
+and [IME / RC vehicles](IME_RC.md).
+
+Map and teleport reference:
+[GTA Vice City Interactive Map by denizariyan](https://github.com/denizariyan/GTA-Vice-City-Interactive-Map).
+The map bitmap is embedded in both EN/CN ASIs.
+
+The sections below describe the earlier implementation in `src/Main.cpp` and
+`reference/plugin-sdk/`; use the controls above for the qiancheng EN/CN builds.
+
 ## Supported Versions
 
 Currently tested:
